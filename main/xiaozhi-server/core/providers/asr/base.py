@@ -239,6 +239,10 @@ class ASRProviderBase(ABC):
         """将语音数据转换为文本"""
         pass
 
+    async def close(self):
+        """资源清理方法 - 子类可以重写此方法进行特定的清理操作"""
+        pass
+
     @staticmethod
     def decode_opus(opus_data: List[bytes]) -> List[bytes]:
         """将Opus音频数据解码为PCM数据"""

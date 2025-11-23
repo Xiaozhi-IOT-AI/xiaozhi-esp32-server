@@ -363,6 +363,30 @@ class TTSProviderBase(ABC):
 
     async def close(self):
         """资源清理方法"""
+        # 等待TTS线程优雅退出（使用异步方式避免阻塞事件循环）
+        if hasattr(self, 'tts_priority_thread') and self.tts_priority_thread and self.tts_priority_thread.is_alive():
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.tts_priority_thread.join(timeout=1)
+                )
+                if self.tts_priority_thread.is_alive():
+                    logger.bind(tag=TAG).warning("TTS线程未能在超时时间内退出")
+            except Exception as e:
+                logger.bind(tag=TAG).debug(f"等待TTS优先级线程退出时出错: {e}")
+
+        # 等待音频播放线程优雅退出
+        if hasattr(self, 'audio_play_priority_thread') and self.audio_play_priority_thread and self.audio_play_priority_thread.is_alive():
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.audio_play_priority_thread.join(timeout=1)
+                )
+                if self.audio_play_priority_thread.is_alive():
+                    logger.bind(tag=TAG).warning("音频播放线程未能在超时时间内退出")
+            except Exception as e:
+                logger.bind(tag=TAG).debug(f"等待音频播放线程退出时出错: {e}")
+
         if hasattr(self, "ws") and self.ws:
             await self.ws.close()
 

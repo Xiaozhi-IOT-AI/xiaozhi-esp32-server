@@ -3,6 +3,7 @@ import wave
 import os
 import sys
 import io
+import gc
 from config.logger import setup_logging
 from typing import Optional, Tuple, List
 from core.providers.asr.dto.dto import InterfaceType
@@ -161,3 +162,14 @@ class ASRProvider(ASRProviderBase):
                     logger.bind(tag=TAG).debug(f"已删除临时音频文件: {file_path}")
                 except Exception as e:
                     logger.bind(tag=TAG).error(f"文件删除失败: {file_path} | 错误: {e}")
+
+    async def close(self):
+        """资源清理方法"""
+        try:
+            if hasattr(self, 'model') and self.model is not None:
+                del self.model
+                self.model = None
+            gc.collect()
+            logger.bind(tag=TAG).debug("Sherpa-ONNX模型资源已释放")
+        except Exception as e:
+            logger.bind(tag=TAG).debug(f"释放Sherpa-ONNX模型资源时出错: {e}")

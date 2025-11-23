@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import gc
 from typing import Optional, Tuple, List
 from .base import ASRProviderBase
 from config.logger import setup_logging
@@ -112,3 +113,17 @@ class ASRProvider(ASRProviderBase):
                     logger.bind(tag=TAG).debug(f"已删除临时音频文件: {file_path}")
                 except Exception as e:
                     logger.bind(tag=TAG).error(f"文件删除失败: {file_path} | 错误: {e}")
+
+    async def close(self):
+        """资源清理方法"""
+        try:
+            if hasattr(self, 'recognizer') and self.recognizer is not None:
+                del self.recognizer
+                self.recognizer = None
+            if hasattr(self, 'model') and self.model is not None:
+                del self.model
+                self.model = None
+            gc.collect()
+            logger.bind(tag=TAG).debug("VOSK资源已释放")
+        except Exception as e:
+            logger.bind(tag=TAG).debug(f"释放VOSK资源时出错: {e}")
