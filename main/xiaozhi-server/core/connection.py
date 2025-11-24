@@ -1,13 +1,12 @@
 import os
-import sys
 import gc
+import sys
 import copy
 import json
 import uuid
 import time
 import queue
 import asyncio
-import weakref
 import threading
 import traceback
 import subprocess
@@ -68,8 +67,7 @@ class ConnectionHandler:
         self.config = copy.deepcopy(config)
         self.session_id = str(uuid.uuid4())
         self.logger = setup_logging()
-        # 使用弱引用避免循环引用
-        self.server = weakref.ref(server) if server is not None else None
+        self.server = server  # 保存server实例的引用
 
         self.need_bind = False  # 是否需要绑定设备
         self.bind_code = None  # 绑定设备的验证码
@@ -94,12 +92,9 @@ class ConnectionHandler:
         self.client_listen_mode = "auto"
 
         # 线程任务相关
-        self.loop = None  # 将在handle_connection中设置
+        self.loop = asyncio.get_event_loop()
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
-
-        # 追踪所有创建的异步任务
-        self.async_tasks = set()
 
         # 添加上报线程池
         self.report_queue = queue.Queue()
@@ -172,9 +167,6 @@ class ConnectionHandler:
 
     async def handle_connection(self, ws):
         try:
-            # 设置事件循环引用
-            self.loop = asyncio.get_running_loop()
-
             # 获取并验证headers
             self.headers = dict(ws.request.headers)
             real_ip = self.headers.get("x-real-ip") or self.headers.get(
@@ -205,7 +197,6 @@ class ConnectionHandler:
 
             # 启动超时检查任务
             self.timeout_task = asyncio.create_task(self._check_timeout())
-            self.async_tasks.add(self.timeout_task)
 
             self.welcome_msg = self.config["xiaozhi"]
             self.welcome_msg["session_id"] = self.session_id
@@ -245,21 +236,29 @@ class ConnectionHandler:
         """保存记忆并关闭连接"""
         try:
             if self.memory:
-                # 直接在当前事件循环中保存记忆，避免创建新的事件循环
-                try:
-                    # 使用当前事件循环直接await，设置短超时
+                # 使用线程池异步保存记忆
+                def save_memory_task():
                     try:
-                        await asyncio.wait_for(
-                            self.memory.save_memory(self.dialogue.dialogue), timeout=2.0
+                        # 创建新事件循环（避免与主循环冲突）
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(
+                            self.memory.save_memory(self.dialogue.dialogue)
                         )
-                    except asyncio.TimeoutError:
-                        self.logger.bind(tag=TAG).warning("保存记忆超时，跳过")
-                except Exception as e:
-                    self.logger.bind(tag=TAG).error(f"保存记忆失败: {e}")
+                    except Exception as e:
+                        self.logger.bind(tag=TAG).error(f"保存记忆失败: {e}")
+                    finally:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
+
+                # 启动线程保存记忆，不等待完成
+                threading.Thread(target=save_memory_task, daemon=True).start()
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"保存记忆失败: {e}")
         finally:
-            # 关闭连接
+            # 立即关闭连接，不等待记忆保存完成
             try:
                 await self.close(ws)
             except Exception as close_error:
@@ -287,9 +286,7 @@ class ConnectionHandler:
                     # 复用现有的绑定提示逻辑
                     from core.handle.receiveAudioHandle import check_bind_device
 
-                    task = asyncio.create_task(check_bind_device(self))
-                    self.async_tasks.add(task)
-                    task.add_done_callback(self.async_tasks.discard)
+                    asyncio.create_task(check_bind_device(self))
                 # 直接丢弃音频，不进行ASR处理
                 return
 
@@ -441,23 +438,15 @@ class ConnectionHandler:
             self._initialize_voiceprint()
 
             # 打开语音识别通道
-            future = asyncio.run_coroutine_threadsafe(
+            asyncio.run_coroutine_threadsafe(
                 self.asr.open_audio_channels(self), self.loop
             )
-            # 不等待，但记录future以便后续清理
-            if not hasattr(self, "pending_futures"):
-                self.pending_futures = []
-            self.pending_futures.append(future)
             if self.tts is None:
                 self.tts = self._initialize_tts()
             # 打开语音合成通道
-            future = asyncio.run_coroutine_threadsafe(
+            asyncio.run_coroutine_threadsafe(
                 self.tts.open_audio_channels(self), self.loop
             )
-            # 不等待，但记录future以便后续清理
-            if not hasattr(self, "pending_futures"):
-                self.pending_futures = []
-            self.pending_futures.append(future)
 
             """加载记忆"""
             self._initialize_memory()
@@ -748,12 +737,7 @@ class ConnectionHandler:
 
         # 异步初始化工具处理器
         if hasattr(self, "loop") and self.loop:
-            future = asyncio.run_coroutine_threadsafe(
-                self.func_handler._initialize(), self.loop
-            )
-            if not hasattr(self, "pending_futures"):
-                self.pending_futures = []
-            self.pending_futures.append(future)
+            asyncio.run_coroutine_threadsafe(self.func_handler._initialize(), self.loop)
 
     def change_system_prompt(self, prompt):
         self.prompt = prompt
@@ -864,14 +848,10 @@ class ConnectionHandler:
 
             # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
             if emotion_flag and content is not None and content.strip():
-                future = asyncio.run_coroutine_threadsafe(
+                asyncio.run_coroutine_threadsafe(
                     textUtils.get_emotion(self, content),
                     self.loop,
                 )
-                # 不需要等待结果，但应该记录以便清理
-                if not hasattr(self, "pending_futures"):
-                    self.pending_futures = []
-                self.pending_futures.append(future)
                 emotion_flag = False
 
             if content is not None and len(content) > 0:
@@ -1070,70 +1050,9 @@ class ConnectionHandler:
     async def close(self, ws=None):
         """资源清理方法"""
         try:
-            # 取消所有追踪的异步任务
-            if hasattr(self, "async_tasks"):
-                for task in list(self.async_tasks):
-                    if not task.done():
-                        task.cancel()
-                    self.async_tasks.discard(task)
-                # 等待所有任务取消
-                if self.async_tasks:
-                    await asyncio.gather(*self.async_tasks, return_exceptions=True)
-                self.async_tasks.clear()
-                self.async_tasks = None
-
-            # 清理pending_futures
-            if hasattr(self, "pending_futures"):
-                for future in self.pending_futures:
-                    if not future.done():
-                        try:
-                            future.cancel()
-                        except:
-                            pass
-                self.pending_futures.clear()
-                self.pending_futures = None
-
             # 清理音频缓冲区
             if hasattr(self, "audio_buffer"):
                 self.audio_buffer.clear()
-                del self.audio_buffer
-
-            # 清理ASR音频缓冲区
-            if hasattr(self, "asr_audio"):
-                self.asr_audio.clear()
-                del self.asr_audio
-            if hasattr(self, "asr_audio_for_voiceprint"):
-                (
-                    self.asr_audio_for_voiceprint.clear()
-                    if hasattr(self.asr_audio_for_voiceprint, "clear")
-                    else None
-                )
-                self.asr_audio_for_voiceprint = None
-
-            # 清理audio_timestamp_buffer
-            if hasattr(self, "audio_timestamp_buffer"):
-                self.audio_timestamp_buffer.clear()
-                self.audio_timestamp_buffer = None
-
-            # 清理其他缓冲区
-            if hasattr(self, "client_audio_buffer"):
-                self.client_audio_buffer.clear()
-                self.client_audio_buffer = None
-            if hasattr(self, "client_voice_window"):
-                self.client_voice_window.clear()
-                self.client_voice_window = None
-            if hasattr(self, "tts_text_buff"):
-                (
-                    self.tts_text_buff.clear()
-                    if hasattr(self.tts_text_buff, "clear")
-                    else None
-                )
-                self.tts_text_buff = None
-
-            # 清理IoT描述符
-            if hasattr(self, "iot_descriptors"):
-                self.iot_descriptors.clear()
-                self.iot_descriptors = None
 
             # 取消超时任务
             if self.timeout_task and not self.timeout_task.done():
@@ -1157,57 +1076,8 @@ class ConnectionHandler:
             if self.stop_event:
                 self.stop_event.set()
 
-            # 等待ASR线程退出（使用异步方式避免阻塞事件循环）
-            if (
-                hasattr(self, "asr_priority_thread")
-                and self.asr_priority_thread
-                and self.asr_priority_thread.is_alive()
-            ):
-                try:
-                    # 在线程池中等待，避免阻塞主事件循环
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: self.asr_priority_thread.join(timeout=1)
-                    )
-                    if self.asr_priority_thread.is_alive():
-                        self.logger.bind(tag=TAG).warning("ASR线程未能在超时时间内退出")
-                except Exception as e:
-                    self.logger.bind(tag=TAG).debug(f"等待ASR线程退出时出错: {e}")
-                finally:
-                    self.asr_priority_thread = None
-
-            # 等待报告线程退出
-            if (
-                hasattr(self, "report_thread")
-                and self.report_thread
-                and self.report_thread.is_alive()
-            ):
-                try:
-                    # 发送停止信号（毒丸）
-                    try:
-                        self.report_queue.put_nowait(None)
-                    except:
-                        pass
-                    # 在线程池中等待，避免阻塞主事件循环
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: self.report_thread.join(timeout=1)
-                    )
-                    if self.report_thread.is_alive():
-                        self.logger.bind(tag=TAG).warning(
-                            "报告线程未能在超时时间内退出"
-                        )
-                except Exception as e:
-                    self.logger.bind(tag=TAG).debug(f"等待报告线程退出时出错: {e}")
-                finally:
-                    self.report_thread = None
-
             # 清空任务队列
             self.clear_queues()
-
-            # 清理队列引用
-            if hasattr(self, "asr_audio_queue"):
-                self.asr_audio_queue = None
-            if hasattr(self, "report_queue"):
-                self.report_queue = None
 
             # 关闭WebSocket连接
             try:
@@ -1257,32 +1127,9 @@ class ConnectionHandler:
                     self.tts = None
 
             # 关闭ASR资源（仅关闭非共享实例）
-            if self.asr:
-                # 只有非本地ASR才需要关闭（本地ASR是共享实例，不能在单个连接关闭时释放）
-                if self.asr is not self._asr:
-                    try:
-                        await self.asr.close()
-                        self.logger.bind(tag=TAG).debug("已关闭非共享ASR实例")
-                    except Exception as asr_error:
-                        self.logger.bind(tag=TAG).debug(
-                            f"关闭ASR资源时出错: {asr_error}"
-                        )
-                    finally:
-                        self.asr = None
-                else:
-                    self.logger.bind(tag=TAG).debug("跳过共享ASR实例的关闭")
-                    self.asr = None
-
-            # VAD是共享实例，不能在单个连接关闭时释放
-            # self.vad = self._vad，所以不需要关闭
+            if self.asr and self.asr is not self._asr:
+                self.asr = None
             if self.vad and self.vad is not self._vad:
-                try:
-                    await self.vad.close()
-                except Exception as vad_error:
-                    self.logger.bind(tag=TAG).debug(f"关闭VAD资源时出错: {vad_error}")
-                finally:
-                    self.vad = None
-            else:
                 self.vad = None
 
             # 清理dialogue对象
@@ -1296,7 +1143,6 @@ class ConnectionHandler:
                         f"清理dialogue时出错: {dialogue_error}"
                     )
 
-            # 清理其他可能持有引用的对象
             self.llm = None
             self.memory = None
             self.intent = None
@@ -1320,55 +1166,15 @@ class ConnectionHandler:
             self.server = None
             self.loop = None
 
-            # 最后关闭线程池（等待任务完成）
+            # 最后关闭线程池（避免阻塞）
             if self.executor:
                 try:
-                    # 使用单独的线程执行shutdown，避免阻塞事件循环
-                    loop = asyncio.get_event_loop()
-
-                    # 创建一个future来等待shutdown完成
-                    shutdown_future = loop.create_future()
-
-                    def shutdown_worker():
-                        try:
-                            # 先不等待，立即关闭
-                            self.executor.shutdown(wait=False, cancel_futures=True)
-                            loop.call_soon_threadsafe(shutdown_future.set_result, None)
-                        except TypeError:
-                            # Python < 3.9 不支持 cancel_futures 参数
-                            try:
-                                self.executor.shutdown(wait=False)
-                                loop.call_soon_threadsafe(
-                                    shutdown_future.set_result, None
-                                )
-                            except Exception as e:
-                                loop.call_soon_threadsafe(
-                                    shutdown_future.set_exception, e
-                                )
-                        except Exception as e:
-                            loop.call_soon_threadsafe(shutdown_future.set_exception, e)
-
-                    shutdown_thread = threading.Thread(
-                        target=shutdown_worker, daemon=False
-                    )
-                    shutdown_thread.start()
-
-                    # 等待最多1秒
-                    try:
-                        await asyncio.wait_for(shutdown_future, timeout=1.0)
-                    except asyncio.TimeoutError:
-                        self.logger.bind(tag=TAG).warning("线程池关闭超时")
-
+                    self.executor.shutdown(wait=False)
                 except Exception as executor_error:
                     self.logger.bind(tag=TAG).error(
                         f"关闭线程池时出错: {executor_error}"
                     )
-                finally:
-                    self.executor = None
-
-            # 清理事件对象
-            if hasattr(self, "stop_event"):
-                self.stop_event = None
+                self.executor = None
 
             self.logger.bind(tag=TAG).info("连接资源已释放")
         except Exception as e:
@@ -1391,31 +1197,21 @@ class ConnectionHandler:
             for q in [
                 self.tts.tts_text_queue,
                 self.tts.tts_audio_queue,
-                self.asr_audio_queue,
                 self.report_queue,
             ]:
                 if not q:
                     continue
-                cleared_count = 0
                 while True:
                     try:
-                        item = q.get_nowait()
-                        # 显式删除队列项以释放内存
-                        del item
-                        cleared_count += 1
+                        q.get_nowait()
                     except queue.Empty:
                         break
-                if cleared_count > 0:
-                    self.logger.bind(tag=TAG).debug(f"清理了 {cleared_count} 个队列项")
 
             self.logger.bind(tag=TAG).debug(
                 f"清理结束: TTS队列大小={self.tts.tts_text_queue.qsize()}, 音频队列大小={self.tts.tts_audio_queue.qsize()}"
             )
 
     def reset_vad_states(self):
-        # 清理旧的缓冲区
-        if hasattr(self, "client_audio_buffer") and self.client_audio_buffer:
-            self.client_audio_buffer.clear()
         self.client_audio_buffer = bytearray()
         self.client_have_voice = False
         self.client_voice_stop = False
